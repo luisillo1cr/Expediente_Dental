@@ -17,8 +17,9 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
-    # 👇 IMPORTANTE: pasar los secrets como env para que Vite los incruste en el build
+    # ✅ Esto es lo que faltaba: pasar VITE_* al build
     env:
+      VITE_CLINIC_ID: ${{ vars.VITE_CLINIC_ID }}
       VITE_FIREBASE_API_KEY: ${{ secrets.VITE_FIREBASE_API_KEY }}
       VITE_FIREBASE_AUTH_DOMAIN: ${{ secrets.VITE_FIREBASE_AUTH_DOMAIN }}
       VITE_FIREBASE_PROJECT_ID: ${{ secrets.VITE_FIREBASE_PROJECT_ID }}
