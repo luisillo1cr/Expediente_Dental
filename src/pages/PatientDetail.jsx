@@ -41,6 +41,7 @@ import { formatExpedienteCode } from "../lib/format";
 
 import PatientFiles from "./PatientFiles";
 import PatientHistory from "./PatientHistory";
+import MedicalQuestionnaire from "../components/MedicalQuestionnaire";
 
 const PROVINCIAS_CR = [
   "San José",
@@ -91,6 +92,47 @@ function isValidCedulaOrPassport(v) {
   return crOk || passOk;
 }
 
+/**
+ * Estructura del cuestionario médico.
+ * Esta forma debe coincidir con MedicalQuestionnaire.jsx y con PatientHistory (badges).
+ */
+const EMPTY_MEDICAL = {
+  underTreatment: null,
+  takingMedication: null,
+
+  conditions: {
+    diabetes: null,
+    arthritis: null,
+    heartDisease: null,
+    rheumaticFever: null,
+    hepatitis: null,
+    ulcers: null,
+    kidneyDisorders: null,
+    nervousDisorders: null,
+    otherText: "",
+  },
+
+  surgeryOrHospitalized: null,
+  healthChangeLastMonths: null,
+
+  allergies: {
+    aspirin: false,
+    penicillin: false,
+    sulfas: false,
+    otherText: "",
+  },
+
+  abnormalAnesthesiaReaction: null,
+  prolongedBleeding: null,
+  fainting: null,
+
+  pregnant: null,
+  lactation: null,
+  menstrualDisorders: null,
+
+  observations: "",
+};
+
 const EMPTY_FORM = {
   expediente: "",
   cedula: "",
@@ -106,6 +148,9 @@ const EMPTY_FORM = {
   distrito: "",
   direccion: "",
   alergias: "",
+
+  // Nuevo: cuestionario médico estructurado
+  medical: EMPTY_MEDICAL,
 };
 
 /**
@@ -245,6 +290,14 @@ export default function PatientDetail({ mode }) {
           distrito: data.distrito ?? "",
           direccion: data.direccion ?? "",
           alergias: data.alergias ?? "",
+
+          // Cargar cuestionario médico (si no existe, usar defaults)
+          medical: {
+            ...EMPTY_MEDICAL,
+            ...(data.medical || {}),
+            conditions: { ...EMPTY_MEDICAL.conditions, ...(data.medical?.conditions || {}) },
+            allergies: { ...EMPTY_MEDICAL.allergies, ...(data.medical?.allergies || {}) },
+          },
         };
 
         if (!alive) return;
@@ -366,7 +419,6 @@ export default function PatientDetail({ mode }) {
   /**
    * Guardado:
    * - En creación o edición, si no hay expediente, se genera automáticamente aquí.
-   * - Esto evita que el usuario tenga que presionar un botón aparte para generar.
    */
   async function onSave() {
     setError("");
@@ -402,6 +454,14 @@ export default function PatientDetail({ mode }) {
         expedienteToSave = await generateNextExpediente();
       }
 
+      // Normalización mínima del cuestionario médico (evita undefined)
+      const medicalToSave = {
+        ...EMPTY_MEDICAL,
+        ...(form.medical || {}),
+        conditions: { ...EMPTY_MEDICAL.conditions, ...(form.medical?.conditions || {}) },
+        allergies: { ...EMPTY_MEDICAL.allergies, ...(form.medical?.allergies || {}) },
+      };
+
       const payload = {
         expediente: expedienteToSave,
         cedula: cedulaNorm,
@@ -417,6 +477,9 @@ export default function PatientDetail({ mode }) {
         distrito: form.distrito.trim(),
         direccion: form.direccion.trim(),
         alergias: form.alergias.trim(),
+
+        // Nuevo: cuestionario médico
+        medical: medicalToSave,
 
         // Borrado lógico
         deleted: false,
@@ -441,7 +504,7 @@ export default function PatientDetail({ mode }) {
 
       await setDoc(patientRef, payload, { merge: true });
 
-      const next = { ...form, expediente: expedienteToSave, cedula: cedulaNorm };
+      const next = { ...form, expediente: expedienteToSave, cedula: cedulaNorm, medical: medicalToSave };
       setForm(next);
       originalRef.current = next;
 
@@ -588,6 +651,7 @@ export default function PatientDetail({ mode }) {
               patientSummary={{
                 expediente: form.expediente,
                 nombre: `${form.nombres} ${form.apellidos}`.trim(),
+                medical: form.medical,
               }}
             />
           </div>
@@ -760,7 +824,7 @@ export default function PatientDetail({ mode }) {
               </div>
 
               <div className="md:col-span-2">
-                <label className="text-sm font-bold text-slate-900">Alergias</label>
+                <label className="text-sm font-bold text-slate-900">Notas</label>
                 <textarea
                   value={form.alergias}
                   onChange={(e) => setField("alergias", e.target.value)}
@@ -768,6 +832,27 @@ export default function PatientDetail({ mode }) {
                   className="mt-1 w-full rounded-2xl border border-slate-200 bg-white py-2 px-3 text-sm outline-none focus:ring-2 focus:ring-emerald-300 disabled:bg-slate-50"
                   disabled={!canWrite || !editing}
                 />
+                <div className="mt-1 text-xs text-slate-500">
+                  
+                </div>
+              </div>
+
+              {/* Nuevo: Cuestionario médico */}
+              <div className="md:col-span-2">
+                <div className="mt-2 rounded-3xl border border-slate-200 bg-white p-4">
+                  <div className="text-sm font-extrabold text-slate-900">Cuestionario médico</div>
+                  <div className="mt-1 text-xs text-slate-500">
+                    Las respuestas se guardan en el expediente y se muestran como alertas en el histórico.
+                  </div>
+
+                  <div className="mt-4">
+                    <MedicalQuestionnaire
+                      value={form.medical}
+                      onChange={(next) => setField("medical", next)}
+                      disabled={!canWrite || !editing}
+                    />
+                  </div>
+                </div>
               </div>
             </div>
 

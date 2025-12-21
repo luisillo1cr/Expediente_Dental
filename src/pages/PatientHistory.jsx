@@ -2,43 +2,45 @@
 import React, { useEffect, useMemo, useState } from "react";
 import {
   addDoc,
+  arrayUnion,
   collection,
   doc,
+  limit,
   onSnapshot,
   orderBy,
   query,
   serverTimestamp,
-  updateDoc,
   setDoc,
-  deleteDoc,
-  limit,
+  updateDoc,
 } from "firebase/firestore";
 import {
-  Search,
-  Calendar,
   Plus,
   Pencil,
   Trash2,
   X,
-  FileText,
-  Image as ImageIcon,
-  Paperclip,
-  CreditCard,
-  Banknote,
+  Search,
+  Calendar,
+  BadgeCheck,
+  AlertTriangle,
 } from "lucide-react";
 
 import { db } from "../firebase";
 import { CLINIC_ID } from "../config";
 import { useSession } from "../auth/useSession";
 import { useFeedback, useConfirm } from "../ui/feedback/hooks";
-import { formatExpedienteCode } from "../lib/format";
 
-/* ------------------------------ Helpers fecha ----------------------------- */
+function cn(...xs) {
+  return xs.filter(Boolean).join(" ");
+}
 
 function toDate(v) {
   if (!v) return null;
   if (v instanceof Date) return v;
   if (typeof v?.toDate === "function") return v.toDate();
+  if (typeof v === "string") {
+    const d = new Date(v);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
   return null;
 }
 
@@ -46,61 +48,156 @@ function pad2(n) {
   return String(n).padStart(2, "0");
 }
 
-function formatDateTime(d) {
-  if (!d) return "-";
-  return `${pad2(d.getDate())}/${pad2(d.getMonth() + 1)}/${d.getFullYear()}, ${pad2(d.getHours())}:${pad2(
-    d.getMinutes()
-  )}`;
-}
-
-function shortUid(uid) {
-  if (!uid) return "-";
-  return String(uid).slice(0, 6) + "…" + String(uid).slice(-4);
-}
-
 function dateOnlyKey(d) {
   if (!d) return "";
   return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
 }
 
-/* ------------------------------ Helpers files ---------------------------- */
-
-function fileIcon(ct) {
-  if ((ct || "").startsWith("image/")) return <ImageIcon className="h-4 w-4" />;
-  return <FileText className="h-4 w-4" />;
-}
-
-function isImage(ct) {
-  return String(ct || "").startsWith("image/");
-}
-
-/* ------------------------------ Helpers pago ----------------------------- */
-
-function parsePago(v) {
-  const raw = String(v ?? "").trim();
-  if (!raw) return null;
-  const cleaned = raw.replace(/[,\s]/g, "");
-  const n = Number(cleaned);
-  if (!Number.isFinite(n) || n < 0) return null;
-  return n;
+function formatDate(d) {
+  if (!d) return "—";
+  return `${pad2(d.getDate())}/${pad2(d.getMonth() + 1)}/${d.getFullYear()}`;
 }
 
 function fmtMoneyCRC(n) {
   const num = Number(n);
   if (!Number.isFinite(num)) return "—";
-  return new Intl.NumberFormat("es-CR", { style: "currency", currency: "CRC", maximumFractionDigits: 0 }).format(num);
+  return new Intl.NumberFormat("es-CR", {
+    style: "currency",
+    currency: "CRC",
+    maximumFractionDigits: 0,
+  }).format(num);
 }
 
-/* --------------------------- Expediente visible -------------------------- */
+/**
+ * Entrada de monto:
+ * - El usuario escribe un número sin separadores (ej: 30000).
+ * - Guardamos el monto como Number en Firestore.
+ * - Al mostrarlo, lo formateamos a CRC.
+ */
+function parseAmount(v) {
+  const raw = String(v ?? "").trim();
+  if (!raw) return null;
 
-function safePatientExpediente(patientSummary) {
-  const exp = String(patientSummary?.expediente || "").trim();
-  if (exp) return exp;
+  // Permitimos que el usuario pegue "30,000" o "30 000" y lo limpiamos.
+  const cleaned = raw.replace(/[,\s]/g, "");
+  const n = Number(cleaned);
 
-  const n = Number(patientSummary?.expedienteNum || 0);
-  if (Number.isFinite(n) && n > 0) return formatExpedienteCode(n, { prefix: "CDO", pad: 6 });
+  if (!Number.isFinite(n) || n < 0) return null;
+  return n;
+}
 
-  return "";
+function truncateText(s, maxLen) {
+  const text = String(s || "").replace(/\s+/g, " ").trim();
+  if (text.length <= maxLen) return text;
+  return `${text.slice(0, Math.max(0, maxLen - 1))}…`;
+}
+
+/**
+ * Construye “alertas” rápidas a partir del objeto medical del paciente.
+ * (con límites para no saturar)
+ */
+function buildMedicalBadges(patientSummary) {
+  const medical = patientSummary?.medical || {};
+  const conditions = medical?.conditions || {};
+  const allergies = medical?.allergies || {};
+
+  const badges = [];
+
+  const add = (label, kind) => {
+    badges.push({ label, kind });
+  };
+
+  if (medical?.underTreatment === true) add("Bajo tratamiento médico", "warn");
+  if (medical?.takingMedication === true) add("Toma medicamentos", "warn");
+
+  if (conditions?.diabetes === true) add("Diabetes", "warn");
+  if (conditions?.arthritis === true) add("Artritis", "warn");
+  if (conditions?.heartDisease === true) add("Enfermedad cardíaca", "danger");
+  if (conditions?.rheumaticFever === true) add("Fiebre reumática", "warn");
+  if (conditions?.hepatitis === true) add("Hepatitis", "danger");
+  if (conditions?.ulcers === true) add("Úlceras", "warn");
+  if (conditions?.kidneyDisorders === true) add("Trastornos renales", "danger");
+  if (conditions?.nervousDisorders === true) add("Trastornos del sistema nervioso", "warn");
+
+  // ✅ keys correctos
+  if (medical?.surgeryOrHospitalized === true) add("Operación / internamiento previo", "warn");
+  if (medical?.healthChangeLastMonths === true) add("Cambios de salud recientes", "warn");
+
+  if (medical?.abnormalAnesthesiaReaction === true) add("Reacción anormal a anestesia", "danger");
+  if (medical?.prolongedBleeding === true) add("Sangrado prolongado", "danger");
+  if (medical?.fainting === true) add("Desmayos", "warn");
+
+  if (medical?.pregnant === true) add("Embarazo", "warn");
+  if (medical?.lactation === true) add("Lactancia", "warn"); // ✅ key correcto
+  if (medical?.menstrualDisorders === true) add("Trastornos del ciclo menstrual", "warn");
+
+  const allergyLabels = [];
+  if (allergies?.aspirin) allergyLabels.push("Aspirina");
+  if (allergies?.penicillin) allergyLabels.push("Penicilina");
+  if (allergies?.sulfas) allergyLabels.push("Sulfas");
+
+  const otherAllergy = String(allergies?.otherText || "").trim();
+  if (otherAllergy) allergyLabels.push(otherAllergy);
+
+  if (allergyLabels.length) {
+    const full = `Alergias: ${allergyLabels.join(", ")}`;
+    add(truncateText(full, 70), "danger");
+  }
+
+  const otherCond = String(conditions?.otherText || "").trim();
+  if (otherCond) add(truncateText(`Otros: ${otherCond}`, 70), "warn");
+
+  const obs = String(medical?.observations || "").trim();
+  if (obs) add(truncateText(`Observaciones: ${obs}`, 70), "warn");
+
+  const MAX_BADGES = 8;
+
+  const sorted = badges.sort((a, b) => {
+    const prio = (k) => (k === "danger" ? 2 : k === "warn" ? 1 : 0);
+    return prio(b.kind) - prio(a.kind);
+  });
+
+  const limited = sorted.slice(0, MAX_BADGES);
+  const remaining = sorted.length - limited.length;
+  if (remaining > 0) limited.push({ label: `+${remaining} más`, kind: "ok" });
+
+  return limited;
+}
+
+function Badge({ kind, children }) {
+  const cls =
+    kind === "danger"
+      ? "bg-rose-50 text-rose-700 ring-rose-200"
+      : kind === "warn"
+        ? "bg-amber-50 text-amber-800 ring-amber-200"
+        : "bg-emerald-50 text-emerald-700 ring-emerald-200";
+
+  const Icon = kind === "danger" ? AlertTriangle : BadgeCheck;
+
+  return (
+    <span className={cn("inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-bold ring-1", cls)}>
+      <Icon className="h-4 w-4" />
+      {children}
+    </span>
+  );
+}
+
+// Helpers: Abono/Debe
+function calcAbono(row) {
+  if (row?.monto == null) return null;
+  const a = row?.abono;
+  if (a == null) return Number(row.monto); // si no hay abono => se asume pago completo
+  const n = Number(a);
+  return Number.isFinite(n) ? n : Number(row.monto);
+}
+
+function calcDebe(row) {
+  if (row?.monto == null) return null;
+  const m = Number(row.monto);
+  if (!Number.isFinite(m)) return null;
+  const a = calcAbono(row);
+  if (a == null) return null;
+  return Math.max(m - a, 0);
 }
 
 export default function PatientHistory({ patientId, canWrite, patientSummary }) {
@@ -109,7 +206,7 @@ export default function PatientHistory({ patientId, canWrite, patientSummary }) 
   const confirm = useConfirm();
 
   const [rows, setRows] = useState([]);
-  const [files, setFiles] = useState([]);
+  const [catalog, setCatalog] = useState([]);
   const [err, setErr] = useState("");
 
   const [qText, setQText] = useState("");
@@ -118,15 +215,6 @@ export default function PatientHistory({ patientId, canWrite, patientSummary }) 
 
   const [openId, setOpenId] = useState(null);
   const [editing, setEditing] = useState(false);
-
-  const [draft, setDraft] = useState({
-    titulo: "",
-    citaAt: "",
-    notas: "",
-    proximaCita: "",
-    pago: "",
-    tipoPago: "",
-  });
 
   const actorName = useMemo(() => {
     return (
@@ -137,143 +225,49 @@ export default function PatientHistory({ patientId, canWrite, patientSummary }) 
     );
   }, [member, user]);
 
-  function agendaIdFor(historyId) {
-    return `${patientId}_${historyId}`;
-  }
+  const medicalBadges = useMemo(() => buildMedicalBadges(patientSummary), [patientSummary]);
 
-  function globalHistoryIdFor(historyId) {
-    return `${patientId}_${historyId}`;
-  }
-
-  async function syncAgenda(historyId, proximaDate, titulo) {
-    const aRef = doc(db, "clinics", CLINIC_ID, "agenda", agendaIdFor(historyId));
-
-    if (!proximaDate || Number.isNaN(proximaDate.getTime()) || proximaDate.getTime() < Date.now()) {
-      try {
-        await deleteDoc(aRef);
-      } catch {}
-      return;
-    }
-
-    await setDoc(
-      aRef,
-      {
-        clinicId: CLINIC_ID,
-        patientId,
-        historyId,
-        proximaCitaAt: proximaDate,
-        titulo: titulo || "",
-        patientNombre: patientSummary?.nombre || "",
-        patientExpediente: safePatientExpediente(patientSummary),
-        updatedAt: serverTimestamp(),
-        updatedBy: user?.uid || null,
-        updatedByName: actorName,
-      },
-      { merge: true }
-    );
-  }
-
-  /**
-   * Denormalización para métricas:
-   * clinics/{clinicId}/history_global/{patientId}_{historyId}
-   */
-  async function syncHistoryGlobal(historyId, data) {
-    const gRef = doc(db, "clinics", CLINIC_ID, "history_global", globalHistoryIdFor(historyId));
-    await setDoc(
-      gRef,
-      {
-        clinicId: CLINIC_ID,
-        patientId,
-        historyId,
-
-        // Campos usados por métricas
-        citaAt: data.citaAt || null,
-        pago: data.pago ?? null,
-        tipoPago: data.tipoPago || "",
-        deleted: !!data.deleted,
-
-        // Útiles para auditoría/UX
-        patientNombre: patientSummary?.nombre || "",
-        patientExpediente: safePatientExpediente(patientSummary),
-
-        updatedAt: serverTimestamp(),
-        updatedBy: user?.uid || null,
-        updatedByName: actorName,
-      },
-      { merge: true }
-    );
-  }
-
-  async function removeHistoryGlobal(historyId) {
-    const gRef = doc(db, "clinics", CLINIC_ID, "history_global", globalHistoryIdFor(historyId));
-    try {
-      await deleteDoc(gRef);
-    } catch {
-      // fallback soft-delete (si rules no permiten delete)
-      try {
-        await setDoc(gRef, { deleted: true, updatedAt: serverTimestamp() }, { merge: true });
-      } catch {}
-    }
-  }
-
-  /* ------------------------------- Snapshots ------------------------------ */
+  const [draft, setDraft] = useState({
+    fecha: "",
+    pieza: "",
+    tratamiento: "",
+    monto: "",
+    abono: "", // ✅ nuevo
+    metodoPago: "",
+    notas: "",
+  });
 
   useEffect(() => {
     if (!patientId) return;
 
-    const col = collection(db, "clinics", CLINIC_ID, "patients", patientId, "history");
-    const q = query(col, orderBy("citaAt", "desc"));
+    const colRef = collection(db, "clinics", CLINIC_ID, "patients", patientId, "treatments");
+    const q = query(colRef, orderBy("fecha", "desc"), limit(1500));
 
-    const unsub = onSnapshot(
+    setErr("");
+    return onSnapshot(
       q,
+      (snap) => setRows(snap.docs.map((d) => ({ id: d.id, ...d.data() }))),
+      () => setErr("No pude cargar tratamientos. Revisá permisos/reglas.")
+    );
+  }, [patientId]);
+
+  useEffect(() => {
+    const ref = doc(db, "clinics", CLINIC_ID, "meta", "treatment_catalog");
+    return onSnapshot(
+      ref,
       (snap) => {
-        setErr("");
-        setRows(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+        const items = snap.exists() ? snap.data()?.items : [];
+        setCatalog(Array.isArray(items) ? items : []);
       },
-      () => setErr("No pude cargar el histórico. Revisá permisos/reglas.")
+      () => setCatalog([])
     );
+  }, []);
 
-    return () => unsub();
-  }, [patientId]);
-
-  useEffect(() => {
-    if (!patientId) return;
-
-    const col = collection(db, "clinics", CLINIC_ID, "patients", patientId, "files");
-    const q = query(col, orderBy("createdAt", "desc"), limit(500));
-
-    const unsub = onSnapshot(
-      q,
-      (snap) => setFiles(snap.docs.map((d) => ({ id: d.id, ...d.data() }))),
-      () => {}
-    );
-
-    return () => unsub();
-  }, [patientId]);
-
-  const filesByHistoryId = useMemo(() => {
-    const map = new Map();
-    for (const f of files) {
-      const ids = Array.isArray(f.linkedHistoryIds) ? f.linkedHistoryIds : [];
-      for (const hid of ids) {
-        if (!map.has(hid)) map.set(hid, []);
-        map.get(hid).push(f);
-      }
-    }
-
-    for (const [k, arr] of map.entries()) {
-      arr.sort((a, b) => {
-        const da = toDate(a.createdAt)?.getTime() || 0;
-        const dbb = toDate(b.createdAt)?.getTime() || 0;
-        return dbb - da;
-      });
-      map.set(k, arr);
-    }
-
-    return map;
-  }, [files]);
-
-  /* -------------------------------- Filtros ------------------------------ */
+  function resetFilters() {
+    setQText("");
+    setFrom("");
+    setTo("");
+  }
 
   const filtered = useMemo(() => {
     const text = (qText || "").trim().toLowerCase();
@@ -283,142 +277,124 @@ export default function PatientHistory({ patientId, canWrite, patientSummary }) 
     return rows
       .filter((r) => !r.deleted)
       .filter((r) => {
-        const d = toDate(r.citaAt);
-        const key = dateOnlyKey(d);
-        if (fromKey && key && key < fromKey) return false;
-        if (toKey && key && key > toKey) return false;
+        const d = toDate(r.fecha);
+        const k = d ? dateOnlyKey(d) : "";
+        if (fromKey && k && k < fromKey) return false;
+        if (toKey && k && k > toKey) return false;
         return true;
       })
       .filter((r) => {
         if (!text) return true;
-        const a = String(r.titulo || "").toLowerCase();
+        const a = String(r.tratamiento || "").toLowerCase();
         const b = String(r.notas || "").toLowerCase();
-        return a.includes(text) || b.includes(text);
+        const c = String(r.pieza || "").toLowerCase();
+        return a.includes(text) || b.includes(text) || c.includes(text);
       });
   }, [rows, qText, from, to]);
 
-  const upcoming = useMemo(() => {
-    const now = Date.now();
-    return filtered
-      .filter((it) => {
-        const d = toDate(it.proximaCita);
-        return d && d.getTime() >= now;
-      })
-      .sort((a, b) => toDate(a.proximaCita) - toDate(b.proximaCita));
-  }, [filtered]);
-
-  const past = useMemo(() => {
-    const now = Date.now();
-    return filtered
-      .filter((it) => {
-        const d = toDate(it.citaAt);
-        return d && d.getTime() < now;
-      })
-      .sort((a, b) => toDate(b.citaAt) - toDate(a.citaAt));
-  }, [filtered]);
-
   const openItem = useMemo(() => filtered.find((x) => x.id === openId) || null, [filtered, openId]);
-
-  function resetFilters() {
-    setQText("");
-    setFrom("");
-    setTo("");
-  }
 
   function openCreate() {
     setOpenId(null);
     setEditing(true);
-    setDraft({ titulo: "", citaAt: "", notas: "", proximaCita: "", pago: "", tipoPago: "" });
+    setErr("");
+    setDraft({ fecha: "", pieza: "", tratamiento: "", monto: "", abono: "", metodoPago: "", notas: "" });
   }
 
   function openView(item) {
     setOpenId(item.id);
     setEditing(false);
+    setErr("");
 
-    const cita = toDate(item.citaAt);
-    const prox = toDate(item.proximaCita);
-
+    const f = toDate(item.fecha);
     setDraft({
-      titulo: item.titulo || "",
-      citaAt: cita ? `${dateOnlyKey(cita)}T${pad2(cita.getHours())}:${pad2(cita.getMinutes())}` : "",
+      fecha: f ? dateOnlyKey(f) : "",
+      pieza: item.pieza || "",
+      tratamiento: item.tratamiento || "",
+      monto: item.monto == null ? "" : String(item.monto),
+      abono: item.abono == null ? "" : String(item.abono),
+      metodoPago: String(item.metodoPago || ""),
       notas: item.notas || "",
-      proximaCita: prox ? `${dateOnlyKey(prox)}T${pad2(prox.getHours())}:${pad2(prox.getMinutes())}` : "",
-      pago: item.pago == null ? "" : String(item.pago),
-      tipoPago: String(item.tipoPago || ""),
     });
   }
 
-  /* ------------------------------- Guardar ------------------------------- */
+  async function ensureTreatmentInCatalog(name) {
+    const t = String(name || "").trim();
+    if (!t) return;
+    const ref = doc(db, "clinics", CLINIC_ID, "meta", "treatment_catalog");
+    await setDoc(ref, { items: arrayUnion(t), updatedAt: serverTimestamp() }, { merge: true });
+  }
 
   async function saveDraft() {
     if (!canWrite) return;
 
-    const titulo = (draft.titulo || "").trim();
-    if (!titulo) return setErr("El motivo/título es requerido.");
-    if (!draft.citaAt) return setErr("La fecha/hora de la cita es requerida.");
+    const fechaStr = (draft.fecha || "").trim();
+    const tratamiento = (draft.tratamiento || "").trim();
 
-    const citaAtDate = new Date(draft.citaAt);
-    const proxima = draft.proximaCita ? new Date(draft.proximaCita) : null;
+    if (!fechaStr) return setErr("La fecha es requerida.");
+    if (!tratamiento) return setErr("El tratamiento es requerido.");
 
-    const pagoNum = parsePago(draft.pago);
-    const tipoPago = String(draft.tipoPago || "").trim();
+    const fecha = new Date(`${fechaStr}T00:00:00`);
+    if (Number.isNaN(fecha.getTime())) return setErr("Fecha inválida.");
+
+    let montoNum = parseAmount(draft.monto);
+    let abonoNum = parseAmount(draft.abono);
+    const metodoPago = String(draft.metodoPago || "").trim();
+
+    // Si el usuario puso solo "abono" y dejó monto vacío, asumimos pago completo
+    if (montoNum == null && abonoNum != null) {
+      montoNum = abonoNum;
+      abonoNum = null;
+    }
+
+    if (montoNum != null && abonoNum != null && abonoNum > montoNum) {
+      return setErr("El abono no puede ser mayor al monto.");
+    }
+
+    // Si abono es igual al monto, lo guardamos como null (pago completo)
+    if (montoNum != null && abonoNum != null && abonoNum === montoNum) {
+      abonoNum = null;
+    }
 
     setErr("");
 
     try {
-      const col = collection(db, "clinics", CLINIC_ID, "patients", patientId, "history");
+      const colRef = collection(db, "clinics", CLINIC_ID, "patients", patientId, "treatments");
+      await ensureTreatmentInCatalog(tratamiento);
 
-      if (!openId) {
-        const ref = await addDoc(col, {
-          clinicId: CLINIC_ID,
-          patientId,
-
-          titulo,
-          notas: (draft.notas || "").trim(),
-          citaAt: citaAtDate,
-          proximaCita: proxima,
-
-          pago: pagoNum,
-          tipoPago,
-
-          patientExpediente: safePatientExpediente(patientSummary),
-          patientNombre: patientSummary?.nombre || "",
-
-          deleted: false,
-          createdAt: serverTimestamp(),
-          createdBy: user?.uid || null,
-          createdByName: actorName,
-          updatedAt: serverTimestamp(),
-          updatedBy: user?.uid || null,
-          updatedByName: actorName,
-        });
-
-        await syncAgenda(ref.id, proxima, titulo);
-        await syncHistoryGlobal(ref.id, { citaAt: citaAtDate, pago: pagoNum, tipoPago, deleted: false });
-
-        fb.success("Cita guardada.");
-        setEditing(false);
-        setDraft({ titulo: "", citaAt: "", notas: "", proximaCita: "", pago: "", tipoPago: "" });
-        return;
-      }
-
-      const ref = doc(db, "clinics", CLINIC_ID, "patients", patientId, "history", openId);
-      await updateDoc(ref, {
-        titulo,
+      const payload = {
+        fecha,
+        pieza: (draft.pieza || "").trim(),
+        tratamiento,
+        monto: montoNum,
+        abono: abonoNum,
+        metodoPago,
         notas: (draft.notas || "").trim(),
-        citaAt: citaAtDate,
-        proximaCita: proxima,
 
-        pago: pagoNum,
-        tipoPago,
+        patientNombre: patientSummary?.nombre || "",
+        deleted: false,
 
         updatedAt: serverTimestamp(),
         updatedBy: user?.uid || null,
         updatedByName: actorName,
-      });
+      };
 
-      await syncAgenda(openId, proxima, titulo);
-      await syncHistoryGlobal(openId, { citaAt: citaAtDate, pago: pagoNum, tipoPago, deleted: false });
+      if (!openId) {
+        await addDoc(colRef, {
+          ...payload,
+          createdAt: serverTimestamp(),
+          createdBy: user?.uid || null,
+          createdByName: actorName,
+        });
+
+        fb.success("Tratamiento guardado.");
+        setEditing(false);
+        setDraft({ fecha: "", pieza: "", tratamiento: "", monto: "", abono: "", metodoPago: "", notas: "" });
+        return;
+      }
+
+      const ref = doc(db, "clinics", CLINIC_ID, "patients", patientId, "treatments", openId);
+      await updateDoc(ref, payload);
 
       fb.success("Cambios guardados.");
       setEditing(false);
@@ -429,23 +405,19 @@ export default function PatientHistory({ patientId, canWrite, patientSummary }) 
     }
   }
 
-  /* ------------------------------- Borrado ------------------------------- */
-
   async function softDeleteItem(item) {
     if (!canWrite) return;
 
-    const ok = await confirm("¿Ocultar esta tarjeta del histórico? (No se borra físicamente)", {
-      title: "Ocultar cita",
+    const ok = await confirm("¿Ocultar este registro? (No se borra físicamente)", {
+      title: "Ocultar tratamiento",
       confirmText: "Ocultar",
       cancelText: "Cancelar",
       danger: true,
     });
     if (!ok) return;
 
-    setErr("");
-
     try {
-      const ref = doc(db, "clinics", CLINIC_ID, "patients", patientId, "history", item.id);
+      const ref = doc(db, "clinics", CLINIC_ID, "patients", patientId, "treatments", item.id);
       await updateDoc(ref, {
         deleted: true,
         deletedAt: serverTimestamp(),
@@ -455,30 +427,44 @@ export default function PatientHistory({ patientId, canWrite, patientSummary }) 
         updatedByName: actorName,
       });
 
-      // Agenda: ya no debe aparecer en dashboard/calendario
-      try {
-        await deleteDoc(doc(db, "clinics", CLINIC_ID, "agenda", agendaIdFor(item.id)));
-      } catch {}
-
-      // Métricas: quitar del global (o marcar deleted)
-      await removeHistoryGlobal(item.id);
-
-      fb.info("Cita ocultada.");
+      fb.info("Registro ocultado.");
       if (openId === item.id) {
         setOpenId(null);
         setEditing(false);
       }
     } catch (e) {
-      const msg = String(e?.message || e);
-      setErr(msg);
-      fb.error(msg);
+      fb.error(String(e?.message || e));
     }
   }
 
-  /* --------------------------------- UI ---------------------------------- */
+  const previewMonto = parseAmount(draft.monto);
+  const previewAbonoRaw = parseAmount(draft.abono);
+  const previewAbono = previewMonto == null ? null : (previewAbonoRaw == null ? previewMonto : previewAbonoRaw);
+  const previewDebe =
+    previewMonto == null || previewAbono == null ? null : Math.max(previewMonto - previewAbono, 0);
 
   return (
     <div className="space-y-4">
+      {/* Alertas clínicas */}
+      <div className="rounded-3xl bg-white p-4 ring-1 ring-slate-200">
+        <div className="text-sm font-extrabold text-slate-900">Alertas clínicas</div>
+        <div className="mt-2 flex flex-wrap gap-2">
+          {medicalBadges.length ? (
+            medicalBadges.map((b, idx) => (
+              <Badge key={idx} kind={b.kind}>
+                {b.label}
+              </Badge>
+            ))
+          ) : (
+            <span className="text-sm text-slate-600">Sin alertas registradas.</span>
+          )}
+        </div>
+        <div className="mt-2 text-xs text-slate-500">
+          Estas alertas salen del “Cuestionario médico” del expediente.
+        </div>
+      </div>
+
+      {/* Filtros */}
       <div className="rounded-3xl bg-white p-4 ring-1 ring-slate-200">
         <div className="grid grid-cols-1 gap-3 lg:grid-cols-12 lg:items-end">
           <div className="lg:col-span-6">
@@ -489,7 +475,7 @@ export default function PatientHistory({ patientId, canWrite, patientSummary }) 
                 <input
                   value={qText}
                   onChange={(e) => setQText(e.target.value)}
-                  placeholder="Buscar por motivo o notas"
+                  placeholder="Buscar por tratamiento, pieza o notas"
                   className="w-full rounded-2xl border border-slate-200 bg-white py-2 pl-10 pr-3 text-sm outline-none focus:ring-2 focus:ring-emerald-300"
                 />
               </div>
@@ -537,10 +523,10 @@ export default function PatientHistory({ patientId, canWrite, patientSummary }) 
             className="inline-flex items-center gap-2 rounded-2xl bg-emerald-600 px-4 py-2 text-sm font-bold text-white hover:bg-emerald-700 disabled:opacity-60"
             onClick={openCreate}
             disabled={!canWrite}
-            title={!canWrite ? "Solo admin/doctor puede agregar citas." : ""}
+            title={!canWrite ? "Solo admin/doctor puede agregar registros." : ""}
           >
             <Plus className="h-4 w-4" />
-            Agregar cita
+            Agregar tratamiento
           </button>
         </div>
 
@@ -551,76 +537,120 @@ export default function PatientHistory({ patientId, canWrite, patientSummary }) 
         ) : null}
       </div>
 
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-        <Section
-          title={`Próximas (${upcoming.length})`}
-          items={upcoming}
-          kind="upcoming"
-          emptyText="Sin registros."
-          onOpen={openView}
-          canWrite={canWrite}
-          onDelete={softDeleteItem}
-          filesByHistoryId={filesByHistoryId}
-        />
+      {/* Lista */}
+      <section className="rounded-3xl bg-white p-4 ring-1 ring-slate-200">
+        <div className="text-sm font-extrabold text-slate-900">Tratamientos ({filtered.length})</div>
 
-        <Section
-          title={`Pasadas (${past.length})`}
-          items={past}
-          kind="past"
-          emptyText="Sin registros."
-          onOpen={openView}
-          canWrite={canWrite}
-          onDelete={softDeleteItem}
-          filesByHistoryId={filesByHistoryId}
-        />
-      </div>
+        {filtered.length === 0 ? (
+          <div className="mt-3 text-sm text-slate-600">Sin registros.</div>
+        ) : (
+          <div className="mt-3 space-y-3">
+            {filtered.map((it) => {
+              const ab = calcAbono(it);
+              const dbv = calcDebe(it);
 
-      {openItem ? (
+              return (
+                <div
+                  key={it.id}
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => openView(it)}
+                  onKeyDown={(e) => e.key === "Enter" && openView(it)}
+                  className="rounded-2xl border border-slate-200 bg-slate-50 p-3 hover:bg-slate-100 cursor-pointer"
+                >
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="text-sm font-extrabold text-slate-900 break-words">
+                        {it.tratamiento || "Tratamiento"}
+                      </div>
+
+                      <div className="mt-1 text-xs text-slate-600">
+                        Fecha: <b>{formatDate(toDate(it.fecha))}</b>
+                        {it.pieza ? (
+                          <>
+                            {" "}
+                            • Pieza: <b>{String(it.pieza)}</b>
+                          </>
+                        ) : null}
+                      </div>
+
+                      <div className="mt-2 flex flex-wrap gap-2 text-xs text-slate-700">
+                        <span className="rounded-full bg-white px-2 py-1 ring-1 ring-slate-200">
+                          Monto: <b>{it.monto == null ? "—" : fmtMoneyCRC(it.monto)}</b>
+                        </span>
+
+                        <span className="rounded-full bg-white px-2 py-1 ring-1 ring-slate-200">
+                          Abono: <b>{ab == null ? "—" : fmtMoneyCRC(ab)}</b>
+                        </span>
+
+                        <span className="rounded-full bg-white px-2 py-1 ring-1 ring-slate-200">
+                          Debe: <b>{dbv == null ? "—" : fmtMoneyCRC(dbv)}</b>
+                        </span>
+
+                        <span className="rounded-full bg-white px-2 py-1 ring-1 ring-slate-200">
+                          Pago: <b>{it.metodoPago ? String(it.metodoPago) : "—"}</b>
+                        </span>
+                      </div>
+
+                      {it.notas ? (
+                        <div className="mt-2 text-sm text-slate-700 whitespace-pre-wrap">{it.notas}</div>
+                      ) : null}
+                    </div>
+
+                    {canWrite ? (
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold hover:bg-slate-50"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            openView(it);
+                            setEditing(true);
+                          }}
+                        >
+                          <Pencil className="h-4 w-4" />
+                          Editar
+                        </button>
+
+                        <button
+                          type="button"
+                          className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold hover:bg-slate-50"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            softDeleteItem(it);
+                          }}
+                        >
+                          <Trash2 className="h-4 w-4" />
+                          Ocultar
+                        </button>
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </section>
+
+      {/* Panel detalle/edición */}
+      {(editing || openItem) ? (
         <div className="rounded-3xl bg-white p-4 ring-1 ring-slate-200">
           <div className="flex flex-wrap items-start justify-between gap-3">
-            <div className="min-w-0">
-              <div className="text-lg font-extrabold text-slate-900 break-words">{openItem.titulo || "Cita"}</div>
-              <div className="mt-1 text-sm text-slate-600">
-                {formatDateTime(toDate(openItem.citaAt))}
-                {openItem.proximaCita ? ` • Próxima: ${formatDateTime(toDate(openItem.proximaCita))}` : ""}
-              </div>
-
-              <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-700">
-                <span className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2 py-1 ring-1 ring-slate-200">
-                  <Banknote className="h-3.5 w-3.5" />
-                  Pago: <b>{openItem.pago == null ? "—" : fmtMoneyCRC(openItem.pago)}</b>
-                </span>
-
-                <span className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2 py-1 ring-1 ring-slate-200">
-                  <CreditCard className="h-3.5 w-3.5" />
-                  Tipo: <b>{openItem.tipoPago ? String(openItem.tipoPago) : "—"}</b>
-                </span>
-              </div>
+            <div className="text-lg font-extrabold text-slate-900">
+              {openId ? "Detalle del tratamiento" : "Nuevo tratamiento"}
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
-              {canWrite ? (
-                <>
-                  {!editing ? (
-                    <button
-                      type="button"
-                      className="inline-flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold hover:bg-slate-50"
-                      onClick={() => setEditing(true)}
-                    >
-                      <Pencil className="h-4 w-4" />
-                      Editar
-                    </button>
-                  ) : null}
-
-                  <button
-                    type="button"
-                    className="inline-flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold hover:bg-slate-50"
-                    onClick={() => softDeleteItem(openItem)}
-                  >
-                    <Trash2 className="h-4 w-4" />
-                    Borrar
-                  </button>
-                </>
+              {openId && canWrite && !editing ? (
+                <button
+                  type="button"
+                  className="inline-flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold hover:bg-slate-50"
+                  onClick={() => setEditing(true)}
+                >
+                  <Pencil className="h-4 w-4" />
+                  Editar
+                </button>
               ) : null}
 
               <button
@@ -639,45 +669,82 @@ export default function PatientHistory({ patientId, canWrite, patientSummary }) 
 
           <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
             <div>
-              <label className="text-sm font-bold text-slate-900">Motivo / Título</label>
+              <label className="text-sm font-bold text-slate-900">Fecha *</label>
               <input
-                value={draft.titulo}
-                onChange={(e) => setDraft((p) => ({ ...p, titulo: e.target.value }))}
-                disabled={!editing || !canWrite}
+                type="date"
+                value={draft.fecha}
+                onChange={(e) => setDraft((p) => ({ ...p, fecha: e.target.value }))}
+                disabled={!editing && !!openId}
                 className="mt-1 w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-emerald-300 disabled:bg-slate-50"
               />
             </div>
 
             <div>
-              <label className="text-sm font-bold text-slate-900">Fecha y hora de la cita</label>
+              <label className="text-sm font-bold text-slate-900">Pieza</label>
               <input
-                type="datetime-local"
-                value={draft.citaAt}
-                onChange={(e) => setDraft((p) => ({ ...p, citaAt: e.target.value }))}
-                disabled={!editing || !canWrite}
+                value={draft.pieza}
+                onChange={(e) => setDraft((p) => ({ ...p, pieza: e.target.value }))}
+                disabled={!editing && !!openId}
                 className="mt-1 w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-emerald-300 disabled:bg-slate-50"
+                placeholder="Ej: 12, 24, 46..."
               />
             </div>
 
-            <div>
-              <label className="text-sm font-bold text-slate-900">Pago</label>
+            <div className="lg:col-span-2">
+              <label className="text-sm font-bold text-slate-900">Tratamiento *</label>
               <input
-                value={draft.pago}
-                onChange={(e) => setDraft((p) => ({ ...p, pago: e.target.value }))}
-                disabled={!editing || !canWrite}
+                list="treatmentCatalog"
+                value={draft.tratamiento}
+                onChange={(e) => setDraft((p) => ({ ...p, tratamiento: e.target.value }))}
+                disabled={!editing && !!openId}
+                className="mt-1 w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-emerald-300 disabled:bg-slate-50"
+                placeholder="Escribí o elegí del listado"
+              />
+              <datalist id="treatmentCatalog">
+                {catalog.map((t) => (
+                  <option key={t} value={t} />
+                ))}
+              </datalist>
+
+              <div className="mt-1 text-xs text-slate-500">
+                Si escribís un tratamiento nuevo, quedará guardado para reutilizarlo luego.
+              </div>
+            </div>
+
+            <div>
+              <label className="text-sm font-bold text-slate-900">Monto (CRC)</label>
+              <input
+                value={draft.monto}
+                onChange={(e) => setDraft((p) => ({ ...p, monto: e.target.value }))}
+                disabled={!editing && !!openId}
                 inputMode="numeric"
-                placeholder="Ej: 25000"
                 className="mt-1 w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-emerald-300 disabled:bg-slate-50"
+                placeholder="Ej: 30000"
               />
-              <div className="mt-1 text-xs text-slate-500">Dejá vacío si no aplica.</div>
+              <div className="mt-1 text-xs text-slate-500">Guardado como número. Se muestra formateado a colones.</div>
             </div>
 
             <div>
-              <label className="text-sm font-bold text-slate-900">Tipo de pago</label>
+              <label className="text-sm font-bold text-slate-900">Abono (CRC)</label>
+              <input
+                value={draft.abono}
+                onChange={(e) => setDraft((p) => ({ ...p, abono: e.target.value }))}
+                disabled={!editing && !!openId}
+                inputMode="numeric"
+                className="mt-1 w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-emerald-300 disabled:bg-slate-50"
+                placeholder="Ej: 10000 (opcional)"
+              />
+              <div className="mt-1 text-xs text-slate-500">
+                Si lo dejás vacío, se asume pago completo. “Debe” se calcula automáticamente.
+              </div>
+            </div>
+
+            <div>
+              <label className="text-sm font-bold text-slate-900">Método de pago</label>
               <select
-                value={draft.tipoPago}
-                onChange={(e) => setDraft((p) => ({ ...p, tipoPago: e.target.value }))}
-                disabled={!editing || !canWrite}
+                value={draft.metodoPago}
+                onChange={(e) => setDraft((p) => ({ ...p, metodoPago: e.target.value }))}
+                disabled={!editing && !!openId}
                 className="mt-1 w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-emerald-300 disabled:bg-slate-50"
               >
                 <option value="">Sin definir</option>
@@ -691,136 +758,16 @@ export default function PatientHistory({ patientId, canWrite, patientSummary }) 
             <div className="lg:col-span-2">
               <label className="text-sm font-bold text-slate-900">Notas</label>
               <textarea
-                rows={4}
+                rows={6}
                 value={draft.notas}
                 onChange={(e) => setDraft((p) => ({ ...p, notas: e.target.value }))}
-                disabled={!editing || !canWrite}
+                disabled={!editing && !!openId}
                 className="mt-1 w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-emerald-300 disabled:bg-slate-50"
+                placeholder="Escribí lo necesario. Este campo permite texto largo."
               />
             </div>
 
-            <div>
-              <label className="text-sm font-bold text-slate-900">Próxima cita (opcional)</label>
-              <input
-                type="datetime-local"
-                value={draft.proximaCita}
-                onChange={(e) => setDraft((p) => ({ ...p, proximaCita: e.target.value }))}
-                disabled={!editing || !canWrite}
-                className="mt-1 w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-emerald-300 disabled:bg-slate-50"
-              />
-            </div>
-
-            <div className="flex items-end justify-end gap-2">
-              {editing ? (
-                <button
-                  type="button"
-                  className="rounded-2xl bg-emerald-600 px-4 py-2 text-sm font-bold text-white hover:bg-emerald-700 disabled:opacity-60"
-                  onClick={saveDraft}
-                  disabled={!canWrite}
-                >
-                  Guardar cambios
-                </button>
-              ) : null}
-            </div>
-          </div>
-
-          <div className="mt-4 rounded-2xl bg-slate-50 p-3 text-sm text-slate-700 ring-1 ring-slate-200">
-            <div className="font-bold">Auditoría</div>
-            <div className="mt-1">
-              Creado por: <b>{openItem.createdByName || shortUid(openItem.createdBy)}</b> • Creado:{" "}
-              <b>{formatDateTime(toDate(openItem.createdAt))}</b>
-            </div>
-            <div className="mt-1">
-              Última actualización: <b>{formatDateTime(toDate(openItem.updatedAt))}</b> • Por:{" "}
-              <b>{openItem.updatedByName || shortUid(openItem.updatedBy)}</b>
-            </div>
-          </div>
-
-          <HistoryFilesPreview files={filesByHistoryId.get(openItem.id) || []} />
-        </div>
-      ) : null}
-
-      {editing && !openId ? (
-        <div className="rounded-3xl bg-white p-4 ring-1 ring-slate-200">
-          <div className="flex items-center justify-between gap-3">
-            <div className="text-lg font-extrabold text-slate-900">Nueva cita</div>
-            <button
-              type="button"
-              className="inline-flex items-center gap-2 rounded-2xl bg-slate-200 px-3 py-2 text-sm font-semibold text-slate-900 hover:bg-slate-300"
-              onClick={() => setEditing(false)}
-            >
-              <X className="h-4 w-4" />
-              Cerrar
-            </button>
-          </div>
-
-          <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
-            <div>
-              <label className="text-sm font-bold text-slate-900">Motivo / Título *</label>
-              <input
-                value={draft.titulo}
-                onChange={(e) => setDraft((p) => ({ ...p, titulo: e.target.value }))}
-                className="mt-1 w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-emerald-300"
-              />
-            </div>
-
-            <div>
-              <label className="text-sm font-bold text-slate-900">Fecha y hora *</label>
-              <input
-                type="datetime-local"
-                value={draft.citaAt}
-                onChange={(e) => setDraft((p) => ({ ...p, citaAt: e.target.value }))}
-                className="mt-1 w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-emerald-300"
-              />
-            </div>
-
-            <div>
-              <label className="text-sm font-bold text-slate-900">Pago</label>
-              <input
-                value={draft.pago}
-                onChange={(e) => setDraft((p) => ({ ...p, pago: e.target.value }))}
-                inputMode="numeric"
-                placeholder="Ej: 25000"
-                className="mt-1 w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-emerald-300"
-              />
-            </div>
-
-            <div>
-              <label className="text-sm font-bold text-slate-900">Tipo de pago</label>
-              <select
-                value={draft.tipoPago}
-                onChange={(e) => setDraft((p) => ({ ...p, tipoPago: e.target.value }))}
-                className="mt-1 w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-emerald-300"
-              >
-                <option value="">Sin definir</option>
-                <option value="sinpe">SINPE</option>
-                <option value="efectivo">Efectivo</option>
-                <option value="transferencia">Transferencia</option>
-                <option value="tarjeta">Tarjeta</option>
-              </select>
-            </div>
-
-            <div className="lg:col-span-2">
-              <label className="text-sm font-bold text-slate-900">Notas</label>
-              <textarea
-                rows={4}
-                value={draft.notas}
-                onChange={(e) => setDraft((p) => ({ ...p, notas: e.target.value }))}
-                className="mt-1 w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-emerald-300"
-              />
-            </div>
-
-            <div>
-              <label className="text-sm font-bold text-slate-900">Próxima cita (opcional)</label>
-              <input
-                type="datetime-local"
-                value={draft.proximaCita}
-                onChange={(e) => setDraft((p) => ({ ...p, proximaCita: e.target.value }))}
-                className="mt-1 w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-emerald-300"
-              />
-            </div>
-
-            <div className="flex items-end justify-end">
+            <div className="flex items-end justify-end gap-2 lg:col-span-2">
               <button
                 type="button"
                 className="rounded-2xl bg-emerald-600 px-4 py-2 text-sm font-bold text-white hover:bg-emerald-700 disabled:opacity-60"
@@ -829,181 +776,30 @@ export default function PatientHistory({ patientId, canWrite, patientSummary }) 
               >
                 Guardar
               </button>
+
+              {openId ? (
+                <button
+                  type="button"
+                  className="rounded-2xl border border-slate-200 bg-white px-4 py-2 text-sm font-bold text-slate-900 hover:bg-slate-50 disabled:opacity-60"
+                  onClick={() => setEditing(false)}
+                  disabled={!canWrite}
+                >
+                  Cancelar edición
+                </button>
+              ) : null}
             </div>
+          </div>
+
+          <div className="mt-4 text-xs text-slate-500">
+            Vista previa: Monto <b>{previewMonto == null ? "—" : fmtMoneyCRC(previewMonto)}</b> • Abono{" "}
+            <b>{previewAbono == null ? "—" : fmtMoneyCRC(previewAbono)}</b> • Debe{" "}
+            <b>{previewDebe == null ? "—" : fmtMoneyCRC(previewDebe)}</b>
           </div>
         </div>
       ) : null}
 
       <div className="rounded-2xl bg-slate-50 p-3 text-sm text-slate-700 ring-1 ring-slate-200">
-        Nota: las tarjetas “Borradas” se ocultan, pero se conservan para auditoría.
-      </div>
-    </div>
-  );
-}
-
-function Section({ title, items, kind, emptyText, onOpen, canWrite, onDelete, filesByHistoryId }) {
-  const maxH = "max-h-[420px]";
-
-  return (
-    <section className="rounded-3xl bg-white p-4 ring-1 ring-slate-200">
-      <div className="flex items-center justify-between gap-2">
-        <div className="text-sm font-extrabold text-slate-900">{title}</div>
-      </div>
-
-      <div className={`mt-3 space-y-3 overflow-y-auto pr-1 ${maxH} nice-scroll`}>
-        {items.length === 0 ? <div className="text-sm text-slate-600">{emptyText}</div> : null}
-
-        {items.map((it) => {
-          const linkedFiles = filesByHistoryId.get(it.id) || [];
-          const preview = linkedFiles.slice(0, 3);
-          const more = Math.max(0, linkedFiles.length - preview.length);
-
-          return (
-            <div
-              key={it.id}
-              role="button"
-              tabIndex={0}
-              onClick={() => onOpen(it)}
-              onKeyDown={(e) => e.key === "Enter" && onOpen(it)}
-              className="rounded-2xl border border-slate-200 bg-slate-50 p-3 hover:bg-slate-100 cursor-pointer"
-            >
-              <div className="flex items-start justify-between gap-2">
-                <div className="min-w-0">
-                  <div className="font-bold text-slate-900 break-words">{it.titulo || "Cita"}</div>
-
-                  <div className="mt-1 text-xs text-slate-600">
-                    {kind === "upcoming" ? (
-                      <>
-                        Próxima: <b>{formatDateTime(toDate(it.proximaCita))}</b>
-                      </>
-                    ) : (
-                      <>{formatDateTime(toDate(it.citaAt))}</>
-                    )}
-                  </div>
-
-                  <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-700">
-                    <span className="rounded-full bg-white px-2 py-1 ring-1 ring-slate-200">
-                      Pago: <b>{it.pago == null ? "—" : fmtMoneyCRC(it.pago)}</b>
-                    </span>
-                    <span className="rounded-full bg-white px-2 py-1 ring-1 ring-slate-200">
-                      Tipo: <b>{it.tipoPago ? String(it.tipoPago) : "—"}</b>
-                    </span>
-                  </div>
-                </div>
-
-                {canWrite ? (
-                  <button
-                    type="button"
-                    className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold hover:bg-slate-50"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onDelete(it);
-                    }}
-                  >
-                    <Trash2 className="h-4 w-4" />
-                    Borrar
-                  </button>
-                ) : null}
-              </div>
-
-              {it.notas ? <div className="mt-2 text-sm text-slate-700 whitespace-pre-wrap">{it.notas}</div> : null}
-
-              <div className="mt-3 flex items-start gap-2 text-xs text-slate-600">
-                <Paperclip className="mt-0.5 h-4 w-4" />
-                <div className="min-w-0">
-                  <div className="font-semibold">Archivos asociados</div>
-
-                  {linkedFiles.length === 0 ? (
-                    <div>Sin archivos.</div>
-                  ) : (
-                    <div className="mt-2 flex flex-wrap items-center gap-2">
-                      {preview.map((f) => (
-                        <a
-                          key={f.id}
-                          href={f.url || "#"}
-                          target="_blank"
-                          rel="noreferrer"
-                          onClick={(e) => e.stopPropagation()}
-                          className="group inline-flex items-center gap-2 rounded-2xl bg-white px-2 py-1 ring-1 ring-slate-200 hover:bg-slate-50"
-                          title={f.name || "Archivo"}
-                        >
-                          {isImage(f.contentType) && f.url ? (
-                            <img
-                              src={f.url}
-                              alt={f.name || "imagen"}
-                              className="h-8 w-8 rounded-xl object-cover ring-1 ring-slate-200"
-                              loading="lazy"
-                            />
-                          ) : (
-                            <span className="inline-flex items-center gap-1">{fileIcon(f.contentType)}</span>
-                          )}
-
-                          <span className="max-w-[160px] truncate text-slate-700">{f.name || f.id}</span>
-                        </a>
-                      ))}
-
-                      {more ? <span className="text-slate-500">+{more} más</span> : null}
-                    </div>
-                  )}
-                </div>
-              </div>
-
-              <div className="mt-3 text-xs text-slate-600">
-                Creado por: <b>{it.createdByName || shortUid(it.createdBy)}</b> • Última act.:{" "}
-                <b>{formatDateTime(toDate(it.updatedAt))}</b>
-              </div>
-            </div>
-          );
-        })}
-      </div>
-    </section>
-  );
-}
-
-function HistoryFilesPreview({ files }) {
-  if (!files || files.length === 0) return null;
-
-  return (
-    <div className="mt-4 rounded-3xl bg-white p-4 ring-1 ring-slate-200">
-      <div className="flex items-center gap-2 text-slate-900">
-        <Paperclip className="h-5 w-5 text-slate-600" />
-        <div className="text-sm font-extrabold">Archivos asociados a esta cita</div>
-        <div className="text-xs text-slate-500">({files.length})</div>
-      </div>
-
-      <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-        {files.map((f) => (
-          <a
-            key={f.id}
-            href={f.url || "#"}
-            target="_blank"
-            rel="noreferrer"
-            className="rounded-2xl border border-slate-200 bg-white p-3 hover:bg-slate-50"
-            title={f.name || "Archivo"}
-          >
-            <div className="flex items-center gap-3">
-              {isImage(f.contentType) && f.url ? (
-                <img
-                  src={f.url}
-                  alt={f.name || "imagen"}
-                  className="h-12 w-12 rounded-2xl object-cover ring-1 ring-slate-200"
-                  loading="lazy"
-                />
-              ) : (
-                <div className="inline-flex h-12 w-12 items-center justify-center rounded-2xl bg-slate-50 ring-1 ring-slate-200">
-                  {fileIcon(f.contentType)}
-                </div>
-              )}
-
-              <div className="min-w-0">
-                <div className="truncate text-sm font-bold text-slate-900">{f.name || f.id}</div>
-                <div className="mt-1 text-xs text-slate-600">
-                  {f.contentType || "—"} • {toDate(f.createdAt) ? formatDateTime(toDate(f.createdAt)) : "—"}
-                </div>
-              </div>
-            </div>
-          </a>
-        ))}
+        Nota: “Ocultar” conserva el registro para auditoría, pero ya no se muestra.
       </div>
     </div>
   );
